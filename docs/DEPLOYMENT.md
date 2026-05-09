@@ -1,4 +1,12 @@
-# Deployment Guide for ProxyMaze'26
+# Deployment Guide for ProxyMaze'26 (Render-First)
+
+## Recommended Deployment Path
+
+Use **Render + Neon PostgreSQL** as the default production setup for this project.
+
+- Render: web service hosting and logs
+- Neon: managed PostgreSQL with free tier
+- Estimated setup time: 5-10 minutes
 
 ## Quick Start: PostgreSQL Database Setup
 
@@ -67,50 +75,9 @@ The service will be available at `http://localhost:8000`
 
 ---
 
-## Deployment to Railway
+## Deployment to Render (Recommended)
 
-Railway is the easiest platform for ProxyMaze - it auto-deploys from GitHub and handles scaling.
-
-### Step 1: Create Railway Account
-
-1. Go to [railway.app](https://railway.app)
-2. Sign up with GitHub
-
-### Step 2: Create New Project
-
-1. Click "Create New Project"
-2. Select "Deploy from GitHub"
-3. Connect your GitHub repository containing this code
-
-### Step 3: Add PostgreSQL Database
-
-1. Click "Add Service" → "PostgreSQL"
-2. Railway creates a PostgreSQL database and auto-sets `DATABASE_URL`
-3. Or use your own Neon/Supabase:
-   - Go to Variables
-   - Paste your Neon/Supabase connection string as `DATABASE_URL`
-
-### Step 4: Configure Start Command
-
-1. Go to your Web Service settings
-2. Set Start Command:
-   ```
-   gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT proxymaze.app:app
-   ```
-
-### Step 5: Deploy
-
-- Railway auto-deploys from your main branch
-- Monitor logs in the Railway dashboard
-- Your service is live! 🚀
-
-**Pro Tip:** Use Neon's free tier for the database (it's better than Railway's PostgreSQL addon for cost).
-
----
-
-## Deployment to Render
-
-Render is a one-click deployment platform. It pairs well with external PostgreSQL (Neon/Supabase).
+Render is the primary deployment platform for this project. It pairs well with external PostgreSQL (Neon/Supabase).
 
 ### Step 1: Create Render Account
 
@@ -150,13 +117,63 @@ Render is a one-click deployment platform. It pairs well with external PostgreSQ
 1. Click "Add Service" → "PostgreSQL"
 2. Render will provide `DATABASE_URL` automatically
 
-### Step 4: Deploy
+### Step 4: Add Runtime Variables
+
+Set in Render dashboard → Environment:
+
+```
+DATABASE_URL=postgresql://...
+PYTHONUNBUFFERED=1
+```
+
+### Step 5: Deploy
 
 - Save settings - Render auto-deploys on git push
 - Monitor in Render dashboard
 - Your service is live! 🚀
 
-**Pro Tip:** Neon is cheaper and faster than Render's PostgreSQL. Pair Render's web service with Neon's database.
+**Pro Tip:** Neon is typically cheaper and faster than Render's managed PostgreSQL. Pair Render's web service with Neon database.
+
+---
+
+## Optional: Deployment to Railway
+
+Railway is the easiest platform for ProxyMaze - it auto-deploys from GitHub and handles scaling.
+
+### Step 1: Create Railway Account
+
+1. Go to [railway.app](https://railway.app)
+2. Sign up with GitHub
+
+### Step 2: Create New Project
+
+1. Click "Create New Project"
+2. Select "Deploy from GitHub"
+3. Connect your GitHub repository containing this code
+
+### Step 3: Add PostgreSQL Database
+
+1. Click "Add Service" → "PostgreSQL"
+2. Railway creates a PostgreSQL database and auto-sets `DATABASE_URL`
+3. Or use your own Neon/Supabase:
+   - Go to Variables
+   - Paste your Neon/Supabase connection string as `DATABASE_URL`
+
+### Step 4: Configure Start Command
+
+1. Go to your Web Service settings
+2. Set Start Command:
+   ```
+   gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT proxymaze.app:app
+   ```
+
+### Step 5: Deploy
+
+- Railway auto-deploys from your main branch
+- Monitor logs in the Railway dashboard
+- Your service is live! 🚀
+
+**Pro Tip:** Use Neon's free tier for the database (it's better than Railway's PostgreSQL addon for cost).
 
 ---
 
@@ -224,16 +241,16 @@ heroku logs --tail
 
 ## Summary: Recommended Stack
 
-| Component      | Recommendation    | Why                           |
-| -------------- | ----------------- | ----------------------------- |
-| **Web App**    | Railway or Render | Auto-scaling, easy deployment |
-| **Database**   | Neon              | Fast, cheap, serverless       |
-| **Cost**       | ~$5-10/month      | Free tier available           |
-| **Setup Time** | 5 minutes         | All one-click                 |
+| Component      | Recommendation | Why                           |
+| -------------- | -------------- | ----------------------------- |
+| **Web App**    | Render         | Auto-scaling, easy deployment |
+| **Database**   | Neon           | Fast, cheap, serverless       |
+| **Cost**       | ~$5-10/month   | Free tier available           |
+| **Setup Time** | 5 minutes      | All one-click                 |
 
-**Fastest Setup: Railway + Neon PostgreSQL**
+**Fastest Setup: Render + Neon PostgreSQL**
 
-- Railway: Deploy from GitHub with one click
+- Render: Deploy from GitHub with one click
 - Neon: Create PostgreSQL in 2 minutes
 - Total: 5 minutes to production
 
@@ -241,18 +258,18 @@ heroku logs --tail
 
 ## Environment Variables Reference
 
-### For Railway
+### For Render
 
-Set in Railway dashboard → Variables:
+Set in Render dashboard → Environment:
 
 ```
 DATABASE_URL=postgresql://...
 PYTHONUNBUFFERED=1
 ```
 
-### For Render
+### For Railway (Optional)
 
-Set in Render dashboard → Environment:
+Set in Railway dashboard → Variables:
 
 ```
 DATABASE_URL=postgresql://...
@@ -282,17 +299,17 @@ python -m uvicorn proxymaze.app:app --reload
 
 ## Monitoring Your Deployment
 
-### Railway
-
-- Go to railway.app dashboard
-- Click your project
-- Monitor "Logs" tab in real-time
-
 ### Render
 
 - Go to render.com dashboard
 - Click your service
 - Monitor "Logs" tab
+
+### Railway (Optional)
+
+- Go to railway.app dashboard
+- Click your project
+- Monitor "Logs" tab in real-time
 
 ### Heroku
 
@@ -305,8 +322,8 @@ heroku logs --tail
 ## Getting Help
 
 - **ProxyMaze Docs**: See README.md, IMPLEMENTATION.md, POSTGRESQL.md
-- **Railway Docs**: https://docs.railway.app
 - **Render Docs**: https://render.com/docs
+- **Railway Docs**: https://docs.railway.app
 - **Neon Docs**: https://neon.tech/docs
 - **Supabase Docs**: https://supabase.com/docs
 
