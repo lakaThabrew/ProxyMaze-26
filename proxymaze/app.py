@@ -423,6 +423,10 @@ async def register_webhook(data: dict, db: Session = Depends(get_db)):
     if not url:
         raise HTTPException(status_code=400, detail="URL is required")
     
+    existing_webhook = db.query(Webhook).filter_by(url=url).first()
+    if existing_webhook:
+        return {"webhook_id": existing_webhook.webhook_id, "url": existing_webhook.url}
+
     webhook_id = f"wh-{uuid.uuid4().hex[:8]}"
     webhook = Webhook(webhook_id=webhook_id, url=url)
     db.add(webhook)
@@ -440,6 +444,18 @@ async def register_integration(data: dict, db: Session = Depends(get_db)):
     
     if not webhook_url or not integration_type:
         raise HTTPException(status_code=400, detail="webhook_url and type required")
+
+    existing_integration = db.query(Integration).filter_by(
+        type=integration_type,
+        webhook_url=webhook_url,
+        username=username,
+    ).first()
+    if existing_integration:
+        return {
+            "id": existing_integration.id,
+            "type": existing_integration.type,
+            "webhook_url": existing_integration.webhook_url,
+        }
     
     integration_id = f"int-{uuid.uuid4().hex[:8]}"
     integration = Integration(
