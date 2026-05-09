@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  proxymaze:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/proxymaze
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - db
+    volumes:
+      - ./proxymaze:/app/proxymaze
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=proxymaze
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
