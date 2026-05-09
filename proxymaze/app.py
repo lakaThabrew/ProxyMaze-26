@@ -12,6 +12,11 @@ import json
 import uuid
 import asyncio
 import aiohttp
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
 
 app = FastAPI(title="ProxyMaze", version="1.0.0")
 
@@ -232,9 +237,21 @@ async def process_webhook_deliveries():
 async def startup():
     """Initialize and start background tasks"""
     global monitoring_task, webhook_task
-    init_db()
-    monitoring_task = asyncio.create_task(run_proxy_monitoring())
-    webhook_task = asyncio.create_task(process_webhook_deliveries())
+    try:
+        db_url = os.getenv("DATABASE_URL", "sqlite:///./proxymaze.db")
+        logger.info(f"Using database: {db_url[:50]}..." if len(db_url) > 50 else db_url)
+        init_db()
+        logger.info("Database initialized successfully")
+        
+        monitoring_task = asyncio.create_task(run_proxy_monitoring())
+        logger.info("Proxy monitoring task started")
+        
+        webhook_task = asyncio.create_task(process_webhook_deliveries())
+        logger.info("Webhook delivery task started")
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}", exc_info=True)
+        raise
+
 
 
 @app.on_event("shutdown")
