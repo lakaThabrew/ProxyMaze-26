@@ -90,9 +90,48 @@ Render is the primary deployment platform for this project. It pairs well with e
 2. Select your GitHub repository
 3. Configure:
    - **Name**: proxymaze
-   - **Environment**: Python 3
+   - **Environment**: Python 3 (select **3.11.x** for best compatibility)
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT proxymaze.app:app`
+
+### Render Dashboard: Exact Step-by-step (explicit UI steps)
+
+Follow these exact dashboard steps so Render installs prebuilt wheels (avoids Rust/Cargo builds):
+
+1. In Render, click **New +** → **Web Service**.
+2. Select **Connect a repository** and pick the repository that contains `Proxy 26`.
+3. Select the branch to deploy (e.g., `main` or `master`).
+4. Under **Name**, enter `proxymaze`.
+5. Under **Environment**, choose **Python** and pick **3.11.x** from the dropdown.
+6. For **Build Command**, paste:
+
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+7. For **Start Command**, paste:
+
+   ```bash
+   gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT proxymaze.app:app
+   ```
+
+8. Set **Instance Type** to the smallest (Starter/Free) if available for testing.
+9. Click **Create Web Service**.
+10. After creation, open the service page and go to **Environment** → **Environment Variables**.
+11. Add `DATABASE_URL` with the Neon/Supabase connection string (see Quick Start). Example:
+    - Key: `DATABASE_URL`
+    - Value: `postgresql://neondb_owner:SECRET@ep-...neon.tech/neondb?sslmode=require`
+
+12. Add `PYTHONUNBUFFERED=1` as an environment variable.
+13. (Optional) Add `CHECK_INTERVAL_SECONDS=15` or other config values as needed.
+14. Save environment variables; Render will redeploy automatically.
+15. Once the deploy succeeds, verify the service by opening the public URL and calling `/health` and `/metrics`.
+
+Notes:
+
+- Choosing Python 3.11 ensures `pydantic-core` downloads a prebuilt wheel rather than attempting a Rust build in Render's read-only build environment.
+- If your project requires a custom build step, use a `Dockerfile` instead (see below).
 
 ### Step 3: Add Database Connection
 
@@ -133,6 +172,64 @@ PYTHONUNBUFFERED=1
 - Your service is live! 🚀
 
 **Pro Tip:** Neon is typically cheaper and faster than Render's managed PostgreSQL. Pair Render's web service with Neon database.
+
+---
+
+## Optional: Deploy to Render Using Docker (Recommended for Python 3.14+)
+
+If you need a writable build environment or are using Python versions without prebuilt dependency wheels, use Docker deployment on Render.
+
+### Why Docker on Render?
+
+When using Python 3.14 or other recent versions, dependencies like `pydantic-core` might require building from source (Rust/Cargo). Render's default build environment is read-only and cannot run these compilers. Docker solves this by:
+
+- Building the image in a full container with write permissions
+- Pre-compiling all dependencies during image build
+- Running pre-built binaries at runtime
+
+### The Dockerfile
+
+A `Dockerfile` is already included in the repository:
+
+- Uses **Python 3.11-slim** (minimal, compatible image)
+- Installs all dependencies with `pip install`
+- Runs as non-root user (`appuser`) for security
+- Includes health check endpoint
+- Uses **4 worker processes** with Gunicorn + Uvicorn
+
+### Render: Create a Docker Service
+
+1. In Render, click **New +** → **Web Service**.
+2. Select **Connect a repository** and pick your repository.
+3. Select the branch to deploy (e.g., `main`).
+4. Under **Runtime**, select **Docker** (Render auto-detects the `Dockerfile`).
+5. Configure:
+   - **Name**: proxymaze
+   - **Instance Type**: Starter (or higher)
+6. Click **Create Web Service**.
+7. After creation, go to **Environment** → **Environment Variables** and add:
+   - Key: `DATABASE_URL`
+   - Value: `postgresql://neondb_owner:...@ep-...neon.tech/neondb?sslmode=require`
+   - Key: `PYTHONUNBUFFERED`
+   - Value: `1`
+8. Save — Render will build the Docker image and deploy automatically.
+
+### Local Testing with Docker
+
+If you have Docker installed locally, test the build:
+
+```bash
+# Build image
+docker build -t proxymaze:latest .
+
+# Run with SQLite (no database)
+docker run -p 8000:8000 proxymaze:latest
+
+# Run with PostgreSQL using docker-compose
+docker-compose up
+```
+
+After `docker-compose up`, the app runs at `http://localhost:8000` with a real PostgreSQL database.
 
 ---
 
