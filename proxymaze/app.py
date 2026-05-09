@@ -24,6 +24,11 @@ THRESHOLD = 0.20
 monitoring_task = None
 webhook_task = None
 
+# Shared HTTP client session to avoid creating many sessions per request
+http_session: aiohttp.ClientSession | None = None
+# Semaphore to limit concurrent checks (helps with memory use)
+MAX_CONCURRENT_CHECKS = int(os.getenv("MAX_CONCURRENT_CHECKS", "50"))
+
 
 @app.get("/")
 async def root():
@@ -37,12 +42,18 @@ async def favicon():
 
 # Background monitoring
 async def check_proxy_health(url: str, timeout: float) -> bool:
-    """Check if proxy is accessible"""
+    """Check if proxy is accessible using shared session"""
+    global http_session
     try:
-        timeout_obj = aiohttp.ClientTimeout(total=timeout)
-        async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                return 200 <= resp.status < 300
+        if http_session is None:
+            # fallback to short lived session if not initialized
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+                async with session.get(url, allow_redirects=True) as resp:
+                    return 200 <= resp.status < 300
+
+        async with http_session.get(url, allow_redirects=True, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
     except Exception:
         return False
 
@@ -150,7 +161,14 @@ async def run_proxy_monitoring():
             timeout_ms = config.request_timeout_ms
             proxies = db.query(Proxy).all()
             
-            tasks = [check_proxy_health(p.url, timeout_ms / 1000.0) for p in proxies]
+            # Limit concurrent checks to avoid memory spikes
+            sem = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+
+            async def _sem_check(p):
+                async with sem:
+                    return await check_proxy_health(p.url, timeout_ms / 1000.0)
+
+            tasks = [_sem_check(p) for p in proxies]
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for proxy, result in zip(proxies, results):
@@ -243,9 +261,14 @@ async def startup():
         init_db()
         logger.info("Database initialized successfully")
         
+        # Initialize shared aiohttp session with sensible defaults
+        global http_session
+        http_timeout = aiohttp.ClientTimeout(total=60)
+        http_session = aiohttp.ClientSession(timeout=http_timeout)
+
         monitoring_task = asyncio.create_task(run_proxy_monitoring())
         logger.info("Proxy monitoring task started")
-        
+
         webhook_task = asyncio.create_task(process_webhook_deliveries())
         logger.info("Webhook delivery task started")
     except Exception as e:
