@@ -1,2 +1,5 @@
 .env
 .env.example
+proxymaze/__pycache__
+proxymaze/__pycache__/
+__pycache__
