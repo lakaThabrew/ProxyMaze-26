@@ -679,6 +679,11 @@ def _build_proxy_detail(rec: dict[str, Any]) -> ProxyDetailResponse:
 # --- Routes ---
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"message": "ProxyMaze API", "health": "/health", "docs": "/docs"}
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse()
