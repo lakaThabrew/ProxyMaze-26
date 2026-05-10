@@ -14,6 +14,7 @@ import asyncio
 import aiohttp
 import logging
 import os
+from .integrations import send_integration_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +46,14 @@ async def check_proxy_health(url: str, timeout: float) -> bool:
     """Check if proxy is accessible using shared session"""
     global http_session
     try:
+        timeout_obj = aiohttp.ClientTimeout(total=timeout)
         if http_session is None:
             # fallback to short lived session if not initialized
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(timeout=timeout_obj) as session:
                 async with session.get(url, allow_redirects=True) as resp:
                     return 200 <= resp.status < 300
 
-        async with http_session.get(url, allow_redirects=True, timeout=timeout) as resp:
+        async with http_session.get(url, allow_redirects=True, timeout=timeout_obj) as resp:
             return 200 <= resp.status < 300
     except Exception:
         return False
@@ -90,21 +91,21 @@ async def evaluate_alerts(db: Session):
             db.commit()
             
             # Queue webhooks
+            payload = {
+                "event": "alert.fired",
+                "alert_id": alert_id,
+                "fired_at": alert.fired_at.isoformat() + "Z",
+                "failure_rate": failure_rate,
+                "total_proxies": total,
+                "failed_proxies": failed,
+                "failed_proxy_ids": failed_proxy_ids,
+                "threshold": THRESHOLD,
+                "message": "Proxy pool failure rate exceeded threshold"
+            }
             integrations = db.query(Integration).all()
             for integration in integrations:
                 events = json.loads(integration.events)
                 if "alert.fired" in events:
-                    payload = {
-                        "event": "alert.fired",
-                        "alert_id": alert_id,
-                        "fired_at": alert.fired_at.isoformat() + "Z",
-                        "failure_rate": failure_rate,
-                        "total_proxies": total,
-                        "failed_proxies": failed,
-                        "failed_proxy_ids": failed_proxy_ids,
-                        "threshold": THRESHOLD,
-                        "message": "Proxy pool failure rate exceeded threshold"
-                    }
                     delivery = WebhookDelivery(
                         webhook_id=integration.id,
                         alert_id=alert_id,
@@ -113,6 +114,16 @@ async def evaluate_alerts(db: Session):
                         payload=json.dumps(payload)
                     )
                     db.add(delivery)
+            webhooks = db.query(Webhook).all()
+            for webhook in webhooks:
+                delivery = WebhookDelivery(
+                    webhook_id=webhook.webhook_id,
+                    alert_id=alert_id,
+                    event_type="alert.fired",
+                    status="pending",
+                    payload=json.dumps(payload)
+                )
+                db.add(delivery)
             db.commit()
         else:
             active_alert.failure_rate = failure_rate
@@ -126,15 +137,15 @@ async def evaluate_alerts(db: Session):
             db.commit()
             
             # Queue resolved webhooks
+            payload = {
+                "event": "alert.resolved",
+                "alert_id": active_alert.alert_id,
+                "resolved_at": active_alert.resolved_at.isoformat() + "Z"
+            }
             integrations = db.query(Integration).all()
             for integration in integrations:
                 events = json.loads(integration.events)
                 if "alert.resolved" in events:
-                    payload = {
-                        "event": "alert.resolved",
-                        "alert_id": active_alert.alert_id,
-                        "resolved_at": active_alert.resolved_at.isoformat() + "Z"
-                    }
                     delivery = WebhookDelivery(
                         webhook_id=integration.id,
                         alert_id=active_alert.alert_id,
@@ -143,6 +154,16 @@ async def evaluate_alerts(db: Session):
                         payload=json.dumps(payload)
                     )
                     db.add(delivery)
+            webhooks = db.query(Webhook).all()
+            for webhook in webhooks:
+                delivery = WebhookDelivery(
+                    webhook_id=webhook.webhook_id,
+                    alert_id=active_alert.alert_id,
+                    event_type="alert.resolved",
+                    status="pending",
+                    payload=json.dumps(payload)
+                )
+                db.add(delivery)
             db.commit()
 
 
@@ -210,42 +231,70 @@ async def process_webhook_deliveries():
         db = SessionLocal()
         try:
             pending = db.query(WebhookDelivery).filter_by(status="pending").all()
-            for delivery in pending:
-                webhook = db.query(Webhook).filter_by(id=delivery.webhook_id).first()
-                if not webhook:
-                    delivery.status = "failed"
-                    db.commit()
-                    continue
-                
+            
+            async def send_delivery(delivery_id):
+                local_db = SessionLocal()
                 try:
-                    timeout = aiohttp.ClientTimeout(total=60)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.post(
-                            webhook.url,
-                            data=delivery.payload,
-                            headers={"Content-Type": "application/json"}
-                        ) as resp:
-                            if 200 <= resp.status < 300:
-                                delivery.status = "delivered"
-                                delivery.delivered_at = datetime.utcnow()
-                            elif resp.status in [500, 502, 503, 504]:
-                                delivery.attempts += 1
-                                delivery.last_attempted_at = datetime.utcnow()
-                                if delivery.attempts >= 5:
-                                    delivery.status = "failed"
-                            else:
-                                delivery.status = "failed"
-                except Exception:
-                    delivery.attempts += 1
-                    delivery.last_attempted_at = datetime.utcnow()
+                    delivery = local_db.query(WebhookDelivery).filter_by(id=delivery_id).first()
+                    if not delivery or delivery.status != "pending":
+                        return
+                    
                     if delivery.attempts >= 5:
                         delivery.status = "failed"
-                
-                db.commit()
+                        local_db.commit()
+                        return
+                        
+                    webhook = local_db.query(Webhook).filter_by(webhook_id=delivery.webhook_id).first()
+                    if webhook:
+                        url_to_call = webhook.url
+                        body = delivery.payload
+                    else:
+                        integration = local_db.query(Integration).filter_by(id=delivery.webhook_id).first()
+                        if not integration:
+                            delivery.status = "failed"
+                            local_db.commit()
+                            return
+                        url_to_call = integration.webhook_url
+                        # formatting integrations logic
+                        alert_data = json.loads(delivery.payload)
+                        outgoing = await send_integration_webhook(integration.type, delivery.event_type, alert_data, url_to_call)
+                        body = json.dumps(outgoing)
+
+                    try:
+                        timeout = aiohttp.ClientTimeout(total=10)
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.post(
+                                url_to_call,
+                                data=body,
+                                headers={"Content-Type": "application/json"}
+                            ) as resp:
+                                if 200 <= resp.status < 300:
+                                    delivery.status = "delivered"
+                                    delivery.delivered_at = datetime.utcnow()
+                                elif resp.status in [500, 502, 503, 504]:
+                                    delivery.attempts += 1
+                                    delivery.last_attempted_at = datetime.utcnow()
+                                    if delivery.attempts >= 5:
+                                        delivery.status = "failed"
+                                else:
+                                    delivery.status = "failed"
+                    except Exception:
+                        delivery.attempts += 1
+                        delivery.last_attempted_at = datetime.utcnow()
+                        if delivery.attempts >= 5:
+                            delivery.status = "failed"
+                    
+                    local_db.commit()
+                finally:
+                    local_db.close()
+
+            tasks = [send_delivery(d.id) for d in pending]
+            if tasks:
+                await asyncio.gather(*tasks)
             
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
         except Exception as e:
-            print(f"Webhook error: {e}")
+            logger.error(f"Webhook error: {e}", exc_info=True)
             await asyncio.sleep(5)
         finally:
             db.close()
