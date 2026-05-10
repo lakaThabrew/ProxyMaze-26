@@ -19,67 +19,67 @@ from fastapi.openapi.utils import get_openapi
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-_state_lock = threading.Lock()
-_main_loop: asyncio.AbstractEventLoop | None = None
-_heartbeat_wake: asyncio.Event | None = None
+app_mutex = threading.Lock()
+event_loop_ref: asyncio.AbstractEventLoop | None = None
+probe_trigger: asyncio.Event | None = None
 
-# --- In-memory state (guard reads/writes with _state_lock) ---
+# --- In-memory state (guard reads/writes with app_mutex) ---
 
-_config: dict[str, int] = {
+service_settings: dict[str, int] = {
     "check_interval_seconds": 15,
     "request_timeout_ms": 3000,
 }
 
-_proxies: dict[str, dict[str, Any]] = {}
-_alerts: list[dict[str, Any]] = []
-_webhooks: dict[str, str] = {}
-_next_webhook_id = 1
-_integrations: dict[str, dict[str, Any]] = {}
-_next_integration_id = 1
-_ALERT_THRESHOLD = 0.2
-_delivery_queue: asyncio.Queue[dict[str, Any]] | None = None
-_delivery_task: asyncio.Task[None] | None = None
-_delivery_enqueued: set[tuple[str, str]] = set()
-_delivery_succeeded: set[tuple[str, str]] = set()
-_metrics: dict[str, int] = {
+proxy_registry: dict[str, dict[str, Any]] = {}
+alert_records: list[dict[str, Any]] = []
+webhook_endpoints: dict[str, str] = {}
+next_webhook_seq = 1
+integration_configs: dict[str, dict[str, Any]] = {}
+next_integration_seq = 1
+BREACH_LEVEL = 0.2
+dispatch_buffer: asyncio.Queue[dict[str, Any]] | None = None
+dispatcher_process: asyncio.Task[None] | None = None
+delivery_tracking_enqueued: set[tuple[str, str]] = set()
+delivery_tracking_done: set[tuple[str, str]] = set()
+operational_stats: dict[str, int] = {
     "total_checks": 0,
     "webhook_deliveries": 0,
 }
 
 
-def _request_heartbeat_wake() -> None:
-    loop = _main_loop
-    ev = _heartbeat_wake
+def trigger_immediate_probe() -> None:
+    loop = event_loop_ref
+    ev = probe_trigger
     if loop is not None and ev is not None:
         loop.call_soon_threadsafe(ev.set)
 
 
-def _utc_now_iso() -> str:
+def timestamp_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def _new_alert_id() -> str:
+def create_alert_identifier() -> str:
     return f"alert-{uuid4().hex[:6]}"
 
 
-def _event_key_from_payload(payload: dict[str, Any]) -> str:
+def derive_event_signature(payload: dict[str, Any]) -> str:
     if payload["event"] == "alert.fired":
         return f"alert.fired:{payload['alert_id']}"
     return f"alert.resolved:{payload['alert_id']}"
 
 
-def _iso_to_unix_seconds(value: str) -> int:
+def convert_iso_to_unix(value: str) -> int:
     return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
 
 
-def _get_alert_by_id_locked(alert_id: str) -> dict[str, Any] | None:
-    for alert in reversed(_alerts):
+def fetch_alert_from_store(alert_id: str) -> dict[str, Any] | None:
+    for alert in reversed(alert_records):
         if alert.get("alert_id") == alert_id:
             return alert
     return None
 
 
-def _format_integration_payload(
+def prepare_external_payload(
     integration: dict[str, Any], event_payload: dict[str, Any]
 ) -> dict[str, Any]:
     """Return Slack Block Kit or Discord Embeds payload for an alert event."""
@@ -87,11 +87,11 @@ def _format_integration_payload(
     alert_id = event_payload["alert_id"]
     username = integration.get("username") or "ProxyMaze"
 
-    alert_data = _get_alert_by_id_locked(alert_id) or {}
+    alert_data = fetch_alert_from_store(alert_id) or {}
     failure_rate = float(event_payload.get("failure_rate", alert_data.get("failure_rate", 0.0)))
     failed_proxies = int(event_payload.get("failed_proxies", alert_data.get("failed_proxies", 0)))
     total_proxies = int(event_payload.get("total_proxies", alert_data.get("total_proxies", 0)))
-    threshold = float(event_payload.get("threshold", alert_data.get("threshold", _ALERT_THRESHOLD)))
+    threshold = float(event_payload.get("threshold", alert_data.get("threshold", BREACH_LEVEL)))
     failed_ids = list(event_payload.get("failed_proxy_ids", alert_data.get("failed_proxy_ids", [])) or [])
     fired_at = event_payload.get("fired_at", alert_data.get("fired_at"))
     resolved_at = event_payload.get("resolved_at", alert_data.get("resolved_at"))
@@ -138,8 +138,8 @@ def _format_integration_payload(
         if event == "alert.fired"
         else f"{header_text}: alert {alert_id} resolved"
     )
-    ts_source = fired_at or resolved_at or _utc_now_iso()
-    ts = _iso_to_unix_seconds(ts_source)
+    ts_source = fired_at or resolved_at or timestamp_now()
+    ts = convert_iso_to_unix(ts_source)
     color = "#D7263D" if event == "alert.fired" else "#2ECC71"
     failed_line = ", ".join(failed_ids) if failed_ids else "none"
 
@@ -166,35 +166,35 @@ def _format_integration_payload(
     }
 
 
-def _sync_alerts_locked() -> list[dict[str, Any]]:
+def evaluate_alert_state() -> list[dict[str, Any]]:
     """Maintain one-active-alert lifecycle based on current proxy states."""
-    total = len(_proxies)
-    failed_ids = sorted([pid for pid, rec in _proxies.items() if rec.get("status") == "down"])
+    total = len(proxy_registry)
+    failed_ids = sorted([pid for pid, rec in proxy_registry.items() if rec.get("status") == "down"])
     failed_count = len(failed_ids)
     failure_rate = (failed_count / total) if total else 0.0
-    now = _utc_now_iso()
+    now = timestamp_now()
     events: list[dict[str, Any]] = []
 
-    active_alert = next((a for a in reversed(_alerts) if a.get("status") == "active"), None)
-    breach = total > 0 and failure_rate >= _ALERT_THRESHOLD
+    active_alert = next((a for a in reversed(alert_records) if a.get("status") == "active"), None)
+    breach = total > 0 and failure_rate >= BREACH_LEVEL
 
     if breach:
         if active_alert is None:
-            _alerts.append(
+            alert_records.append(
                 {
-                    "alert_id": _new_alert_id(),
+                    "alert_id": create_alert_identifier(),
                     "status": "active",
                     "failure_rate": failure_rate,
                     "total_proxies": total,
                     "failed_proxies": failed_count,
                     "failed_proxy_ids": failed_ids,
-                    "threshold": _ALERT_THRESHOLD,
+                    "threshold": BREACH_LEVEL,
                     "fired_at": now,
                     "resolved_at": None,
                     "message": "Proxy pool failure rate exceeded threshold",
                 }
             )
-            current = _alerts[-1]
+            current = alert_records[-1]
             events.append(
                 {
                     "event": "alert.fired",
@@ -215,7 +215,7 @@ def _sync_alerts_locked() -> list[dict[str, Any]]:
         active_alert["total_proxies"] = total
         active_alert["failed_proxies"] = failed_count
         active_alert["failed_proxy_ids"] = failed_ids
-        active_alert["threshold"] = _ALERT_THRESHOLD
+        active_alert["threshold"] = BREACH_LEVEL
         active_alert["message"] = "Proxy pool failure rate exceeded threshold"
         return events
 
@@ -232,21 +232,21 @@ def _sync_alerts_locked() -> list[dict[str, Any]]:
     return events
 
 
-async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
-    queue = _delivery_queue
+async def stage_outgoing_events(event_payload: dict[str, Any]) -> None:
+    queue = dispatch_buffer
     if queue is None:
         return
-    event_key = _event_key_from_payload(event_payload)
-    with _state_lock:
-        webhooks = list(_webhooks.items())
-        integrations = list(_integrations.items())
+    event_key = derive_event_signature(event_payload)
+    with app_mutex:
+        webhooks = list(webhook_endpoints.items())
+        integrations = list(integration_configs.items())
         to_enqueue: list[dict[str, Any]] = []
         for webhook_id, url in webhooks:
             recipient_id = f"webhook:{webhook_id}"
             marker = (event_key, recipient_id)
-            if marker in _delivery_succeeded or marker in _delivery_enqueued:
+            if marker in delivery_tracking_done or marker in delivery_tracking_enqueued:
                 continue
-            _delivery_enqueued.add(marker)
+            delivery_tracking_enqueued.add(marker)
             to_enqueue.append(
                 {
                     "recipient_id": recipient_id,
@@ -261,23 +261,23 @@ async def _enqueue_event_deliveries(event_payload: dict[str, Any]) -> None:
                 continue
             recipient_id = f"integration:{integration_id}"
             marker = (event_key, recipient_id)
-            if marker in _delivery_succeeded or marker in _delivery_enqueued:
+            if marker in delivery_tracking_done or marker in delivery_tracking_enqueued:
                 continue
-            _delivery_enqueued.add(marker)
+            delivery_tracking_enqueued.add(marker)
             to_enqueue.append(
                 {
                     "recipient_id": recipient_id,
                     "url": integration["webhook_url"],
                     "event_key": event_key,
-                    "payload": _format_integration_payload(integration, dict(event_payload)),
+                    "payload": prepare_external_payload(integration, dict(event_payload)),
                 }
             )
     for item in to_enqueue:
         await queue.put(item)
 
 
-async def _delivery_worker() -> None:
-    queue = _delivery_queue
+async def event_dispatcher_loop() -> None:
+    queue = dispatch_buffer
     if queue is None:
         return
     timeout = httpx.Timeout(8.0)
@@ -316,19 +316,19 @@ async def _delivery_worker() -> None:
                                 continue
                             break
                         if 200 <= resp.status_code < 300:
-                            with _state_lock:
-                                _delivery_enqueued.discard(marker)
-                                _delivery_succeeded.add(marker)
-                                _metrics["webhook_deliveries"] += 1
+                            with app_mutex:
+                                delivery_tracking_enqueued.discard(marker)
+                                delivery_tracking_done.add(marker)
+                                operational_stats["webhook_deliveries"] += 1
                             break
                         if resp.status_code in (500, 502, 503, 504):
                             await asyncio.sleep(backoff_s)
                             backoff_s = min(backoff_s * 2.0, 30.0)
                             continue
-                        with _state_lock:
-                            _delivery_enqueued.discard(marker)
+                        with app_mutex:
+                            delivery_tracking_enqueued.discard(marker)
                             # Do not keep re-enqueuing forever on permanent 4xx responses.
-                            _delivery_succeeded.add(marker)
+                            delivery_tracking_done.add(marker)
                         break
                     except httpx.RequestError:
                         await asyncio.sleep(backoff_s)
@@ -337,7 +337,7 @@ async def _delivery_worker() -> None:
                 queue.task_done()
 
 
-async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
+async def execute_health_check(client: httpx.AsyncClient, url: str, timeout_s: float) -> bool:
     timeout = httpx.Timeout(timeout_s)
     try:
         r = await client.head(url, timeout=timeout, follow_redirects=True)
@@ -349,13 +349,13 @@ async def _probe_proxy(client: httpx.AsyncClient, url: str, timeout_s: float) ->
         return False
 
 
-async def _heartbeat_loop() -> None:
+async def background_monitoring_cycle() -> None:
     limits = httpx.Limits(max_connections=200, max_keepalive_connections=50)
     async with httpx.AsyncClient(limits=limits) as client:
         while True:
-            with _state_lock:
-                cfg = _config.copy()
-                targets = [(pid, _proxies[pid]["url"]) for pid in sorted(_proxies.keys())]
+            with app_mutex:
+                cfg = service_settings.copy()
+                targets = [(pid, proxy_registry[pid]["url"]) for pid in sorted(proxy_registry.keys())]
 
             interval = cfg["check_interval_seconds"]
             timeout_s = cfg["request_timeout_ms"] / 1000.0
@@ -363,17 +363,17 @@ async def _heartbeat_loop() -> None:
             if targets:
                 # Probe in parallel so a round isn't N * timeout.
                 results = await asyncio.gather(
-                    *[_probe_proxy(client, url, timeout_s) for _, url in targets],
+                    *[execute_health_check(client, url, timeout_s) for _, url in targets],
                     return_exceptions=True,
                 )
-                at = _utc_now_iso()
-                with _state_lock:
+                at = timestamp_now()
+                with app_mutex:
                     for (pid, _), ok in zip(targets, results):
-                        if pid not in _proxies:
+                        if pid not in proxy_registry:
                             continue
                         is_up = bool(ok) if not isinstance(ok, Exception) else False
-                        _metrics["total_checks"] += 1
-                        rec = _proxies[pid]
+                        operational_stats["total_checks"] += 1
+                        rec = proxy_registry[pid]
                         if is_up:
                             rec["status"] = "up"
                             rec["consecutive_failures"] = 0
@@ -387,12 +387,12 @@ async def _heartbeat_loop() -> None:
                         history = rec.setdefault("history", [])
                         history.append({"checked_at": at, "status": rec["status"]})
 
-            with _state_lock:
-                events = _sync_alerts_locked()
+            with app_mutex:
+                events = evaluate_alert_state()
             for event_payload in events:
-                await _enqueue_event_deliveries(event_payload)
+                await stage_outgoing_events(event_payload)
 
-            wake = _heartbeat_wake
+            wake = probe_trigger
             if wake is None:
                 break
             wake.clear()
@@ -403,35 +403,35 @@ async def _heartbeat_loop() -> None:
 
 
 @asynccontextmanager
-async def _lifespan(app: FastAPI):
-    global _main_loop, _heartbeat_wake, _delivery_queue, _delivery_task
-    _main_loop = asyncio.get_running_loop()
-    _heartbeat_wake = asyncio.Event()
-    _delivery_queue = asyncio.Queue()
-    _delivery_task = asyncio.create_task(_delivery_worker())
-    task = asyncio.create_task(_heartbeat_loop())
+async def app_lifecycle_manager(app: FastAPI):
+    global event_loop_ref, probe_trigger, dispatch_buffer, dispatcher_process
+    event_loop_ref = asyncio.get_running_loop()
+    probe_trigger = asyncio.Event()
+    dispatch_buffer = asyncio.Queue()
+    dispatcher_process = asyncio.create_task(event_dispatcher_loop())
+    task = asyncio.create_task(background_monitoring_cycle())
     try:
         yield
     finally:
         task.cancel()
-        if _delivery_task is not None:
-            _delivery_task.cancel()
+        if dispatcher_process is not None:
+            dispatcher_process.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-        if _delivery_task is not None:
+        if dispatcher_process is not None:
             try:
-                await _delivery_task
+                await dispatcher_process
             except asyncio.CancelledError:
                 pass
-        _delivery_task = None
-        _delivery_queue = None
-        _main_loop = None
-        _heartbeat_wake = None
+        dispatcher_process = None
+        dispatch_buffer = None
+        event_loop_ref = None
+        probe_trigger = None
 
 
-app = FastAPI(title="ProxyMaze", lifespan=_lifespan)
+app = FastAPI(title="ProxyMaze", lifespan=app_lifecycle_manager)
 
 # Trust X-Forwarded-* from Render so OpenAPI / logs see https and the public host.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -465,11 +465,11 @@ app.openapi = custom_openapi  # type: ignore[method-assign]
 # --- Pydantic models ---
 
 
-class HealthResponse(BaseModel):
+class ServiceStatus(BaseModel):
     status: Literal["ok"] = "ok"
 
 
-class ConfigUpdate(BaseModel):
+class UpdateSettings(BaseModel):
     check_interval_seconds: int | None = None
     request_timeout_ms: int | None = None
 
@@ -488,12 +488,12 @@ class ConfigUpdate(BaseModel):
         return v
 
 
-class ConfigResponse(BaseModel):
+class CurrentSettings(BaseModel):
     check_interval_seconds: int
     request_timeout_ms: int
 
 
-class ProxiesUpsert(BaseModel):
+class BulkProxyLoad(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     proxies: list[str] = Field(default_factory=list)
@@ -508,7 +508,7 @@ class ProxiesUpsert(BaseModel):
         return v
 
 
-class ProxyRecord(BaseModel):
+class ProxyInfo(BaseModel):
     id: str
     url: str
     status: Literal["pending", "up", "down"] = "pending"
@@ -516,25 +516,25 @@ class ProxyRecord(BaseModel):
     consecutive_failures: int = 0
 
 
-class ProxiesUpsertResponse(BaseModel):
+class BulkLoadResult(BaseModel):
     accepted: int
-    proxies: list[ProxyRecord]
+    proxies: list[ProxyInfo]
 
 
-class ProxiesListResponse(BaseModel):
+class ProxyRegistryOverview(BaseModel):
     total: int
     up: int
     down: int
     failure_rate: float
-    proxies: list[ProxyRecord]
+    proxies: list[ProxyInfo]
 
 
-class ProxyHistoryEntry(BaseModel):
+class CheckEvent(BaseModel):
     checked_at: str
     status: Literal["up", "down"]
 
 
-class AlertsListResponse(BaseModel):
+class AlertDetail(BaseModel):
     alert_id: str
     status: Literal["active", "resolved"]
     failure_rate: float
@@ -547,7 +547,7 @@ class AlertsListResponse(BaseModel):
     message: str
 
 
-class WebhookCreateRequest(BaseModel):
+class RegisterWebhook(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     url: str
@@ -562,12 +562,12 @@ class WebhookCreateRequest(BaseModel):
         return value
 
 
-class WebhookCreateResponse(BaseModel):
+class WebhookRegistration(BaseModel):
     webhook_id: str
     url: str
 
 
-class IntegrationCreateRequest(BaseModel):
+class AddIntegration(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     type: Literal["slack", "discord"]
@@ -604,7 +604,7 @@ class IntegrationCreateRequest(BaseModel):
         return v
 
 
-class IntegrationCreateResponse(BaseModel):
+class IntegrationAdded(BaseModel):
     integration_id: str
     type: Literal["slack", "discord"]
     webhook_url: str
@@ -612,7 +612,7 @@ class IntegrationCreateResponse(BaseModel):
     events: list[Literal["alert.fired", "alert.resolved"]]
 
 
-class MetricsResponse(BaseModel):
+class SystemMetrics(BaseModel):
     total_checks: int
     current_pool_size: int
     active_alerts: int
@@ -620,7 +620,7 @@ class MetricsResponse(BaseModel):
     webhook_deliveries: int
 
 
-class ProxyDetailResponse(BaseModel):
+class DetailedProxyInfo(BaseModel):
     id: str
     url: str
     status: Literal["pending", "up", "down"]
@@ -628,13 +628,13 @@ class ProxyDetailResponse(BaseModel):
     consecutive_failures: int
     total_checks: int
     uptime_percentage: float
-    history: list[ProxyHistoryEntry]
+    history: list[CheckEvent]
 
 
 # --- Helpers ---
 
 
-def _proxy_id_from_url(url: str) -> str:
+def extract_id_from_proxy_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("proxy URL must be an absolute http(s) URL with a host")
@@ -650,7 +650,7 @@ def _proxy_id_from_url(url: str) -> str:
     return segment
 
 
-def _merge_config(data: dict[str, int], update: ConfigUpdate) -> dict[str, int]:
+def consolidate_settings(data: dict[str, int], update: UpdateSettings) -> dict[str, int]:
     out = data.copy()
     if update.check_interval_seconds is not None:
         out["check_interval_seconds"] = update.check_interval_seconds
@@ -659,12 +659,12 @@ def _merge_config(data: dict[str, int], update: ConfigUpdate) -> dict[str, int]:
     return out
 
 
-def _build_proxy_detail(rec: dict[str, Any]) -> ProxyDetailResponse:
+def format_proxy_detailed_view(rec: dict[str, Any]) -> DetailedProxyInfo:
     total_checks = int(rec.get("total_checks") or 0)
     total_successes = int(rec.get("total_successes") or 0)
     uptime_percentage = round((total_successes / total_checks) * 100.0, 1) if total_checks else 0.0
-    history = [ProxyHistoryEntry(**h) for h in rec.get("history", [])]
-    return ProxyDetailResponse(
+    history = [CheckEvent(**h) for h in rec.get("history", [])]
+    return DetailedProxyInfo(
         id=rec["id"],
         url=rec["url"],
         status=rec["status"],
@@ -684,42 +684,42 @@ def root() -> dict[str, str]:
     return {"message": "ProxyMaze API", "health": "/health", "docs": "/docs"}
 
 
-@app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-    return HealthResponse()
+@app.get("/health", response_model=ServiceStatus)
+def health() -> ServiceStatus:
+    return ServiceStatus()
 
 
-@app.post("/config", response_model=ConfigResponse)
-def post_config(body: ConfigUpdate) -> ConfigResponse:
+@app.post("/config", response_model=CurrentSettings)
+def post_config(body: UpdateSettings) -> CurrentSettings:
     """Set monitoring cadence (`check_interval_seconds`) and probe timeout (`request_timeout_ms`).
 
     Values take effect immediately: the next probe cycle uses the new timeout, and the sleep
     between full passes is interrupted so a new pass can start right away.
     """
-    global _config
-    with _state_lock:
-        _config = _merge_config(_config, body)
-        out = ConfigResponse(**_config)
-    _request_heartbeat_wake()
+    global service_settings
+    with app_mutex:
+        service_settings = consolidate_settings(service_settings, body)
+        out = CurrentSettings(**service_settings)
+    trigger_immediate_probe()
     return out
 
 
-@app.get("/config", response_model=ConfigResponse)
-def get_config() -> ConfigResponse:
-    with _state_lock:
-        return ConfigResponse(**_config)
+@app.get("/config", response_model=CurrentSettings)
+def get_config() -> CurrentSettings:
+    with app_mutex:
+        return CurrentSettings(**service_settings)
 
 
 @app.post(
     "/proxies",
-    response_model=ProxiesUpsertResponse,
+    response_model=BulkLoadResult,
     status_code=status.HTTP_201_CREATED,
 )
-def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
-    global _proxies
-    with _state_lock:
+def post_proxies(body: BulkProxyLoad) -> BulkLoadResult:
+    global proxy_registry
+    with app_mutex:
         if body.replace:
-            _proxies = {}
+            proxy_registry = {}
 
         accepted = 0
         accepted_ids: list[str] = []
@@ -728,12 +728,12 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
         for raw in body.proxies:
             url = raw.strip()
             try:
-                pid = _proxy_id_from_url(url)
+                pid = extract_id_from_proxy_url(url)
             except ValueError as e:
                 errors.append(f"{raw!r}: {e}")
                 continue
 
-            _proxies[pid] = {
+            proxy_registry[pid] = {
                 "id": pid,
                 "url": url,
                 "status": "pending",
@@ -752,21 +752,21 @@ def post_proxies(body: ProxiesUpsert) -> ProxiesUpsertResponse:
                 detail={"message": "No valid proxies in request", "errors": errors},
             )
 
-        records = [ProxyRecord(**_proxies[k]) for k in sorted(accepted_ids)]
-        result = ProxiesUpsertResponse(accepted=accepted, proxies=records)
-    _request_heartbeat_wake()
+        records = [ProxyInfo(**proxy_registry[k]) for k in sorted(accepted_ids)]
+        result = BulkLoadResult(accepted=accepted, proxies=records)
+    trigger_immediate_probe()
     return result
 
 
-@app.get("/proxies", response_model=ProxiesListResponse)
-def get_proxies() -> ProxiesListResponse:
-    with _state_lock:
-        items = [ProxyRecord(**_proxies[k]) for k in sorted(_proxies.keys())]
+@app.get("/proxies", response_model=ProxyRegistryOverview)
+def get_proxies() -> ProxyRegistryOverview:
+    with app_mutex:
+        items = [ProxyInfo(**proxy_registry[k]) for k in sorted(proxy_registry.keys())]
         total = len(items)
         up = sum(1 for p in items if p.status == "up")
         down = sum(1 for p in items if p.status == "down")
         failure_rate = (down / total) if total else 0.0
-        return ProxiesListResponse(
+        return ProxyRegistryOverview(
             total=total,
             up=up,
             down=down,
@@ -775,77 +775,77 @@ def get_proxies() -> ProxiesListResponse:
         )
 
 
-@app.get("/proxies/{proxy_id}", response_model=ProxyDetailResponse)
-def get_proxy_by_id(proxy_id: str) -> ProxyDetailResponse:
-    with _state_lock:
-        rec = _proxies.get(proxy_id)
+@app.get("/proxies/{proxy_id}", response_model=DetailedProxyInfo)
+def get_proxy_by_id(proxy_id: str) -> DetailedProxyInfo:
+    with app_mutex:
+        rec = proxy_registry.get(proxy_id)
         if rec is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"message": f"Proxy '{proxy_id}' not found"},
             )
-        return _build_proxy_detail(dict(rec))
+        return format_proxy_detailed_view(dict(rec))
 
 
-@app.get("/proxies/{proxy_id}/history", response_model=list[ProxyHistoryEntry])
-def get_proxy_history(proxy_id: str) -> list[ProxyHistoryEntry]:
-    with _state_lock:
-        rec = _proxies.get(proxy_id)
+@app.get("/proxies/{proxy_id}/history", response_model=list[CheckEvent])
+def get_proxy_history(proxy_id: str) -> list[CheckEvent]:
+    with app_mutex:
+        rec = proxy_registry.get(proxy_id)
         if rec is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"message": f"Proxy '{proxy_id}' not found"},
             )
-        return [ProxyHistoryEntry(**h) for h in rec.get("history", [])]
+        return [CheckEvent(**h) for h in rec.get("history", [])]
 
 
 @app.delete("/proxies", status_code=status.HTTP_204_NO_CONTENT)
 def delete_proxies() -> Response:
-    global _proxies
-    with _state_lock:
-        _proxies = {}
-    _request_heartbeat_wake()
+    global proxy_registry
+    with app_mutex:
+        proxy_registry = {}
+    trigger_immediate_probe()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@app.get("/alerts", response_model=list[AlertsListResponse])
-def get_alerts() -> list[AlertsListResponse]:
-    with _state_lock:
+@app.get("/alerts", response_model=list[AlertDetail])
+def get_alerts() -> list[AlertDetail]:
+    with app_mutex:
         # Alert history survives proxy pool purge.
-        return [AlertsListResponse(**dict(a)) for a in _alerts]
+        return [AlertDetail(**dict(a)) for a in alert_records]
 
 
 @app.post(
     "/webhooks",
-    response_model=WebhookCreateResponse,
+    response_model=WebhookRegistration,
     status_code=status.HTTP_201_CREATED,
 )
-def post_webhooks(body: WebhookCreateRequest) -> WebhookCreateResponse:
-    global _next_webhook_id
-    with _state_lock:
-        webhook_id = f"wh-{_next_webhook_id}"
-        _next_webhook_id += 1
-        _webhooks[webhook_id] = body.url
-        return WebhookCreateResponse(webhook_id=webhook_id, url=body.url)
+def post_webhooks(body: RegisterWebhook) -> WebhookRegistration:
+    global next_webhook_seq
+    with app_mutex:
+        webhook_id = f"wh-{next_webhook_seq}"
+        next_webhook_seq += 1
+        webhook_endpoints[webhook_id] = body.url
+        return WebhookRegistration(webhook_id=webhook_id, url=body.url)
 
 
 @app.post(
     "/integrations",
-    response_model=IntegrationCreateResponse,
+    response_model=IntegrationAdded,
     status_code=status.HTTP_201_CREATED,
 )
-def post_integrations(body: IntegrationCreateRequest) -> IntegrationCreateResponse:
-    global _next_integration_id
-    with _state_lock:
-        integration_id = f"int-{_next_integration_id}"
-        _next_integration_id += 1
-        _integrations[integration_id] = {
+def post_integrations(body: AddIntegration) -> IntegrationAdded:
+    global next_integration_seq
+    with app_mutex:
+        integration_id = f"int-{next_integration_seq}"
+        next_integration_seq += 1
+        integration_configs[integration_id] = {
             "type": body.type,
             "webhook_url": body.webhook_url,
             "username": body.username,
             "events": list(body.events),
         }
-        return IntegrationCreateResponse(
+        return IntegrationAdded(
             integration_id=integration_id,
             type=body.type,
             webhook_url=body.webhook_url,
@@ -854,16 +854,16 @@ def post_integrations(body: IntegrationCreateRequest) -> IntegrationCreateRespon
         )
 
 
-@app.get("/metrics", response_model=MetricsResponse)
-def get_metrics() -> MetricsResponse:
-    with _state_lock:
-        active_alerts = sum(1 for a in _alerts if a.get("status") == "active")
-        return MetricsResponse(
-            total_checks=_metrics["total_checks"],
-            current_pool_size=len(_proxies),
+@app.get("/metrics", response_model=SystemMetrics)
+def get_metrics() -> SystemMetrics:
+    with app_mutex:
+        active_alerts = sum(1 for a in alert_records if a.get("status") == "active")
+        return SystemMetrics(
+            total_checks=operational_stats["total_checks"],
+            current_pool_size=len(proxy_registry),
             active_alerts=active_alerts,
-            total_alerts=len(_alerts),
-            webhook_deliveries=_metrics["webhook_deliveries"],
+            total_alerts=len(alert_records),
+            webhook_deliveries=operational_stats["webhook_deliveries"],
         )
 
 
