@@ -23,10 +23,12 @@ USER appuser
 # Expose port
 EXPOSE 8000
 
+# Default port
+ENV PORT=8000
+
 # Health check using built-in urllib
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || exit 1
+    CMD python -c "import urllib.request, os; port = os.environ.get('PORT', '8000'); urllib.request.urlopen('http://localhost:' + port + '/health').read()" || exit 1
 
 # Run with gunicorn for production
-ENV GUNICORN_CMD_ARGS="--workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 120 --graceful-timeout 30 --max-requests 1000"
-CMD ["sh", "-c", "exec gunicorn $GUNICORN_CMD_ARGS proxymaze.app:app"]
+CMD ["sh", "-c", "exec gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT --timeout 120 --graceful-timeout 30 --max-requests 1000 proxymaze.app:app"]
