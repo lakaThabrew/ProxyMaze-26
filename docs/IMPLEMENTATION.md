@@ -85,7 +85,7 @@ delivery = WebhookDelivery(
     payload=json.dumps(payload)
 )
 
-# Processes every 5 seconds
+# Processes every 2 seconds
 for delivery in db.query(WebhookDelivery).filter_by(status="pending"):
     if send_webhook(webhook.url, delivery.payload):
         delivery.status = "delivered"
@@ -302,7 +302,7 @@ Index on (proxy_id) for history lookup
 ### Webhook Delivery
 
 ```
-Pending queues processed every 5 seconds
+Pending queues processed every 2 seconds
 Max 5 retries per delivery
 Transient errors (5xx) are retried
 Permanent errors (4xx) fail immediately

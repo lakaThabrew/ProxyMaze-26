@@ -240,8 +240,8 @@ curl -X POST http://localhost:8000/integrations \
 - All timestamps are ISO 8601 UTC (e.g., `2026-04-24T10:15:30Z`)
 - Proxy IDs extracted from final URL segment
 - Request bodies accept unknown fields without error
-- Retry logic: 5 attempts max, exponential backoff
-- Webhook delivery timeout: 60 seconds
+- Retry logic: 5 attempts max, 2-second fixed backoff
+- Webhook delivery timeout: 10 seconds
 - Max concurrent proxy checks: unlimited (per config)
 
 ---
